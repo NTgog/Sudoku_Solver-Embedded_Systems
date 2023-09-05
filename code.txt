@@ -1,0 +1,437 @@
+/*
+* MySudoku.c
+*
+* Created: 12/15/2021 9:22:27 PM
+* Authors :	Konstantinos Mylonas  and Nikos Toganidis 
+*			2018030151						2018030085
+*
+* AVR ATmega16 receive unsolved sudoku information via a specified protocol
+* and solves it with backtracking algorithm.
+* Read report.pdf for more information
+*
+*/ 
+
+
+#define F_CPU 10000000UL
+
+#include <avr/io.h>
+#include <avr/interrupt.h>
+#include <util/delay.h>
+
+#define N 9
+#define UNASSIGNED 0
+#define FLAGS_NUM 9				// Total number of flags used.	
+#define SET_LEDS 0XFF			// Shift this value to set or unset the LEDS
+#define UBRR 64					// Calculated in report.
+
+/* Global variables */
+uint8_t matrix[N][N];			
+uint8_t flags[FLAGS_NUM];		//
+uint8_t temp[3];
+uint8_t temp_index = 0;
+uint8_t filled = 0;				// Number of non-zero cells
+uint8_t iterate_idx = 0;
+
+
+/* Functions */
+void init_usart();
+void init_port();
+void init_matrix();
+void react();
+void reset_flags();
+void save_number();
+void send_cell(uint8_t cell);
+void send_done();
+void send_ok();
+void led_check();
+uint8_t calculate_cell();
+
+/* Solve sudoku functions */
+uint8_t find_unassigned_location(uint8_t grid[N][N], uint8_t* row, uint8_t* col);
+uint8_t is_safe(uint8_t grid[N][N], uint8_t row, uint8_t col, uint8_t num);
+uint8_t used_in_box(uint8_t grid[N][N], uint8_t boxStartRow, uint8_t boxStartCol, uint8_t num);
+uint8_t used_in_col(uint8_t grid[N][N], uint8_t col, uint8_t num);
+uint8_t used_in_row(uint8_t grid[N][N], uint8_t row, uint8_t num);
+uint8_t solve_sudoku();
+
+int main(void)
+{
+	/* Initializations */
+	init_matrix();
+	init_usart();
+	init_port();
+	
+	sei();	
+	
+    while (1) 
+    {
+		if(flags[FLAGS_NUM-1] == 1){
+			react();
+		}
+    }
+}
+
+/* Transmit char with polling */
+void USART_Transmit( unsigned char data )
+{
+	/* Wait for empty transmit buffer */
+	while ( !( UCSRA & (1<<UDRE)) ){}
+	/* Put data into buffer, sends the data */
+	UDR = data;
+}
+
+
+/* Receive interrupt handler */
+ISR(USART_RXC_vect){
+
+	uint8_t received = UDR;
+	
+	/* Set flags according to the received character */
+	switch(received){
+		case 65:						// A
+			flags[0] = 1;
+			break;
+		case 84:						// T	
+			flags[1] = 1;
+			break;
+		case 67:						// C
+			flags[2] = 1;
+			break;
+		case 80:						// P
+			flags[3] = 1;
+			break;	
+		case 83:						// S
+			flags[4] = 1;
+			break;
+		case 66:						// B
+			flags[5] = 1;
+			break;
+		case 68:						// D
+			temp_index=0;
+			flags[6] = 1;
+			break;
+		case 13:						// CR
+			break;
+		case 10:						// LF
+			flags[FLAGS_NUM-1] = 1; 
+			break;
+		case 78:						// N
+			temp_index = 0;
+			flags[7] = 1;
+			break;
+		default:						// X Y VAL
+			temp[temp_index] = received & (0x0f);		// Mask to convert to BCD format
+			temp_index++;
+			break;
+		
+
+	}
+		return;
+}
+
+
+/*
+ * React according to the set flags 
+ * Called only after <LF> is received
+*/
+void react(){
+	
+	// AT
+	
+	if(flags[0] == 1 && flags[1] == 1){		
+		send_ok();
+	}
+	
+	// C
+	
+	else if(flags[2] == 1){				
+		init_matrix();
+		send_ok();
+		
+	}
+	
+	// P
+	
+	else if(flags[3] == 1){					
+		send_ok();
+		
+		/* Reset LF flag for break case */
+		flags[FLAGS_NUM-1] = 0;
+		solve_sudoku();
+		
+		/* If not break -> send done */
+		/* else if break -> send ok  */
+		if(flags[5] == 0)
+			send_done();
+		else if(flags[5] == 1)
+			send_ok();
+	}
+	
+	// S
+	
+	else if(flags[4] == 1){
+		
+		/* Send first cell */					
+		iterate_idx = 0;				
+		send_cell(iterate_idx);
+	}
+	
+	// T
+	
+	else if(flags[1] == 1){					
+		
+		/* Send next cell or done if all cells have been sent */
+		send_cell(iterate_idx+1);
+		iterate_idx++;
+		if(iterate_idx==80){
+			send_done();
+		}		
+		
+	}
+	
+	// B
+	
+	else if(flags[5] == 1){					
+		send_ok();
+	}
+	
+	// D
+	
+	else if(flags[6] == 1){
+		/* Calculate which is the requested cell and send it back */					
+		uint8_t cell = calculate_cell();
+		send_cell(cell);	
+		
+	}
+	
+	// N
+	
+	else if(flags[7] == 1){					
+		save_number();
+		send_ok();
+	}
+	
+	reset_flags();
+	
+}
+
+
+/* Given the coordinates of a cell, returns the position of this cell starting from 0
+*  For example row = 1, col = 3 corresponds to the cell number 2 or equivalent matrix[0][2]
+*/
+uint8_t calculate_cell(){
+	return (temp[1] - 1)*N + temp[0] - 1;		//	(row-1)*N + col - 1
+	
+}
+
+/* Save the received number at the right cell of matrix. */
+void save_number(){
+	uint8_t col = temp[0]-1;
+	uint8_t row = temp[1]-1;
+	uint8_t val = temp[2];
+	matrix[row][col] = val;
+	filled++;
+	led_check();
+	
+}
+
+/* Given the number of a cell, its coordinates and 
+*  its value are transmitted in ASCII format 
+*/
+void send_cell(uint8_t cell){
+	
+	/* Fetch the right values */
+	uint8_t col = cell % 9;
+	uint8_t row = cell / 9;
+	uint8_t val = matrix[row][col];
+	
+	/* Convert to the right format */
+	/* 49 = 48 + 1.*/ 
+	/* +48 is to convert to ascii */
+	/* +1 is because we work 0-8 while protocol works 1-9 */
+	row = row + 49;
+	col = col + 49;
+	val = val + 48;
+	
+	USART_Transmit('N');
+	USART_Transmit(col);
+	USART_Transmit(row);
+	USART_Transmit(val);
+	USART_Transmit('\r');
+	USART_Transmit('\n');
+}
+
+/* Transmit done*/
+void send_done(){
+	
+	USART_Transmit('D');
+	USART_Transmit('\r');
+	USART_Transmit('\n');
+}
+
+/* Transmit ok */
+void send_ok(){
+
+	USART_Transmit('O');
+	USART_Transmit('K');
+	USART_Transmit('\r');
+	USART_Transmit('\n');
+	
+}
+
+/* Unset all flags */
+void reset_flags(){
+	for(int i=0; i<FLAGS_NUM; i++){
+		flags[i] = 0;
+	}
+}
+
+/* Set corresponding LEDS according to how 
+*  many cells are filled in the matrix 
+*/
+void led_check(){
+	
+	/* Leds are on at 0 */
+	int shift = filled / 10;
+	PORTB = (SET_LEDS << shift);
+	
+}
+
+/* Fill board with zeros */
+void init_matrix(){
+	
+	for(int i = 0 ; i<9 ; i++){ 
+		for(int j = 0; j<9 ; j++){ 
+			matrix[i][j] = 0;
+		}
+	}
+	filled = 0;
+	led_check();
+}
+
+/* PORTB as output and initially 0xFF */
+void init_port(){
+	
+	/* Switch off LEDs */
+	DDRB = 0xFF;
+	PORTB = 0xFF;
+	
+}
+
+/* Initialize USART */
+void init_usart()
+{
+	
+	/* Set baud rate generator for 9600 baud */
+	UBRRH =	(unsigned char)(UBRR>>8);
+	UBRRL = (unsigned char)UBRR;
+	
+	/* Set frame format: 8 bit, no parity, 1 stop bit */
+	//UCSRC = (1<<URSEL) | (1<<UMSEL) | (1<<UCSZ0) | (1<<UCSZ1);
+	
+	/* Enable receiver, transmitter and receive complete interrupt */
+	UCSRB = (1<<RXEN) | (1<<TXEN) | (1<<RXCIE);
+	
+	
+} 
+
+/**************************************** SOLVE SUDOKU BACKTRACKING ALGORITHM *************************/
+
+
+uint8_t solve_sudoku()
+{
+    uint8_t row, col;
+	
+
+	if(flags[5] == 1 && flags[FLAGS_NUM-1] == 1){
+		return 1;
+	}
+	
+	
+	// Use delay to check break 
+	//_delay_ms(100);
+    
+	
+	// Check If there is no unassigned
+    // location, we are done
+    if (!find_unassigned_location(matrix, &row, &col))
+        return 1; // success!
+ 
+    //Cconsider digits 1 to 9
+    for (uint8_t num = 1; num <= 9; num++)
+    {
+         
+        // Check if looks promising
+        if (is_safe(matrix, row, col, num))
+        {
+             
+            // Make tentative assignment
+            matrix[row][col] = num;
+			filled++;
+			led_check();
+ 
+            // Return, if success, yay!
+            if (solve_sudoku())
+                return 1;
+ 
+            // Failure, unmake & try again
+            matrix[row][col] = UNASSIGNED;
+			filled--;
+			led_check();
+        }
+    }
+   
+    // This triggers backtracking
+    return 0;
+}
+
+
+uint8_t find_unassigned_location(uint8_t grid[N][N], uint8_t* row, uint8_t* col)
+{
+    for (*row = 0; *row < N; (*row)++)
+        for (*col = 0; *col < N; (*col)++)
+            if (grid[*row][*col] == UNASSIGNED)
+                return 1;
+    return 0;
+}
+
+uint8_t used_in_row(uint8_t grid[N][N], uint8_t row, uint8_t num)
+{
+    for (uint8_t col = 0; col < N; col++)
+        if (grid[row][col] == num)
+            return 1;
+    return 0;
+}
+
+uint8_t used_in_col(uint8_t grid[N][N], uint8_t col, uint8_t num)
+{
+    for (uint8_t row = 0; row < N; row++)
+        if (grid[row][col] == num)
+            return 1;
+    return 0;
+}
+
+uint8_t used_in_box(uint8_t grid[N][N], uint8_t boxStartRow, uint8_t boxStartCol, uint8_t num)
+{
+    for (uint8_t row = 0; row < 3; row++)
+        for (uint8_t col = 0; col < 3; col++)
+            if (grid[row + boxStartRow][col + boxStartCol] == num)
+                return 1;
+    return 0;
+}
+
+uint8_t is_safe(uint8_t grid[N][N], uint8_t row, uint8_t col, uint8_t num)
+{
+     
+    /* Check if 'num' is not already placed
+       in current row, current column and
+       current 3x3 box */
+    return !used_in_row(grid, row, num)
+           && !used_in_col(grid, col, num)
+           && !used_in_box(grid, row - row % 3,
+                         col - col % 3, num)
+           && grid[row][col] == UNASSIGNED;
+}
+
+
+	
